@@ -25,7 +25,7 @@ import { Typeahead } from "react-bootstrap-typeahead";
 import styled, { isStyledComponent, keyframes } from "styled-components";
 import { OverlayTrigger, Tooltip } from "react-bootstrap";
 import Big from "big.js";
-import * as elliptic from "elliptic";
+import * as ellipticDep from "elliptic";
 import BN from "bn.js";
 import * as nacl from "tweetnacl";
 import SecureIframe from "../components/SecureIframe";
@@ -36,6 +36,9 @@ import jsx from "acorn-jsx";
 import { ethers } from "ethers";
 import { Web3ConnectButton } from "../components/ethers";
 import { isValidAttribute } from "dompurify";
+import { networks as BitcoinNetworks, Psbt as BitcoinPsbt, Transaction as BitcoinTransaction, payments as BitcoinPayments } from 'bitcoinjs-lib';
+import * as cryptoNodeJS from 'crypto'
+import * as bs58 from 'bs58'
 
 // Radix:
 import * as Accordion from "@radix-ui/react-accordion";
@@ -75,6 +78,8 @@ const ExpressionDebug = false;
 const StatementDebug = false;
 
 const MAX_INTERVALS = 16;
+
+const secp256k1Elliptic = new ellipticDep.ec("secp256k1");
 
 const NativePrototypes = [
   Object.prototype,
@@ -1484,6 +1489,7 @@ export default class VM {
   constructor(options) {
     const {
       near,
+      bitcoin,
       rawCode,
       setReactState,
       cache,
@@ -1503,6 +1509,8 @@ export default class VM {
     this.rawCode = rawCode;
 
     this.near = near;
+    this.bitcoin = bitcoin;
+
     try {
       this.code = parseCode(rawCode);
       this.compileError = null;
@@ -1679,6 +1687,80 @@ export default class VM {
             },
           ]);
         }
+      },
+    };
+
+    const CryptoFns = {
+      epsilonPrefixForVersion: (version) => {
+        return `near-mpc-recovery v${version} epsilon derivation:`
+      },
+      deriveEpsilon: (signerId, path, version = '0.1.0') => {
+        const derivationPath = `${(CryptoFns.epsilonPrefixForVersion(version))}${signerId},${path}`;
+        const hash = cryptoNodeJS.createHash("sha256").update(derivationPath).digest();
+        // I wonder if the calls to "reverse the payload" could be checked against
+        // big endian. probably completely unrelated, but a thought
+        const ret = new BN(hash, "le").toString("hex");
+
+        return ret;
+      },
+      deriveKey: (publicKeyStr, epsilon) => {
+        const base58PublicKey = publicKeyStr.split(":")[1];
+        const decodedPublicKey = Buffer.from(bs58.decode(base58PublicKey)).toString("hex");
+        // Mike note: my IDE is misinterpreting the line below and I have to ignore it.
+        const publicKey = secp256k1Elliptic.keyFromPublic(`04${decodedPublicKey}`, 'hex');
+        const derivedPoint = publicKey.getPublic().add(secp256k1Elliptic.g.mul(epsilon));
+        const derivedPointEncoded = derivedPoint.encode("hex", false);
+        return derivedPointEncoded
+      },
+    };
+
+    const NearMPC = {
+      TESTNET_MPC_PUBLIC_KEY: "secp256k1:4HFcTSodRLVCGNVcGc4Mf2fwBBBxv9jxkGdiW2S2CA1y6UpVVRWKj6RX7d7TDt65k2Bj3w9FU4BGtt43ZvuhCnNt",
+    }
+
+    const Bitcoin = {
+      networks: () => {
+        return BitcoinNetworks
+      },
+      deriveProductionAddress: (signerId, path, networkName, version = '0.1.0') => {
+        networkName = networkName === 'mainnet' ? 'bitcoin' : networkName
+        const epsilon = CryptoFns.deriveEpsilon(signerId, path, version);
+        const derivedKey = CryptoFns.deriveKey(
+            NearMPC.TESTNET_MPC_PUBLIC_KEY,
+            epsilon
+        );
+
+        const publicKeyBuffer = Buffer.from(derivedKey, "hex");
+
+        const { address } = BitcoinPayments.p2pkh({
+          pubkey: publicKeyBuffer,
+          network: Bitcoin.networks()[networkName],
+        });
+
+        if (!address) {
+          throw new Error("Unable to derive BTC address");
+        }
+
+        return {
+          address,
+          publicKey: publicKeyBuffer,
+        };
+      },
+      joinSignature: (signature) => {
+        const r = signature.r.padStart(64, "0");
+        const s = signature.s.padStart(64, "0");
+
+        const rawSignature = Buffer.from(r + s, "hex");
+
+        if (rawSignature.length !== 64) {
+          throw new Error("Invalid signature length.");
+        }
+
+        return rawSignature;
+      },
+      toSatoshi: (btc) => (btc * 100_000_000),
+      fetchUTXOs: (address, btcRpcEndpoint) => {
+        if (address) return this.uncachedBitcoinUTXOs(address, btcRpcEndpoint)
       },
     };
 
@@ -1904,6 +1986,8 @@ export default class VM {
       socialGet: Social.get,
       Social,
       Near,
+      Bitcoin,
+      CryptoFns,
       stringify: vmJSON.stringify,
       JSON: vmJSON,
       Object: vmObject,
@@ -2179,6 +2263,9 @@ export default class VM {
       subscribe
     );
   }
+  uncachedBitcoinUTXOs(address, rpc) {
+    return this.bitcoin.fetchUTXOs(address, rpc)
+  }
 
   asyncFetch(url, options) {
     return this.cache.asyncFetch(url, options);
@@ -2268,6 +2355,7 @@ export default class VM {
     }
     const vm = new VM({
       near: this.near,
+      bitcoin: this.bitcoin,
       rawCode: code,
       cache: this.cache,
       refreshCache: this.refreshCache,
