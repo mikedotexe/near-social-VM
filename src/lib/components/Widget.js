@@ -27,6 +27,7 @@ import { useAccountId } from "../data/account";
 import Big from "big.js";
 import uuid from "react-uuid";
 import { EthersProviderContext } from "./ethers";
+import {useBitcoin} from "../data/bitcoin";
 
 export const Widget = React.forwardRef((props, forwardedRef) => {
   const {
@@ -54,15 +55,16 @@ export const Widget = React.forwardRef((props, forwardedRef) => {
   const [prevVmInput, setPrevVmInput] = useState(null);
   const [configs, setConfigs] = useState(null);
   const [srcOrCode, setSrcOrCode] = useState(null);
- 
+
   const ethersProviderContext = useContext(EthersProviderContext);
-  
+
   const networkId =
     configs &&
     configs.findLast((config) => config && config.networkId)?.networkId;
   const cache = useCache(networkId);
   const near = useNear(networkId);
   const accountId = useAccountId(networkId);
+  const bitcoin = useBitcoin(networkId);
   const [element, setElement] = useState(null);
 
   useEffect(() => {
@@ -159,6 +161,7 @@ export const Widget = React.forwardRef((props, forwardedRef) => {
     setReactState({ hooks: [], state: undefined });
     const vm = new VM({
       near,
+      bitcoin,
       rawCode: code,
       setReactState,
       cache,
@@ -180,6 +183,7 @@ export const Widget = React.forwardRef((props, forwardedRef) => {
   }, [
     src,
     near,
+    bitcoin,
     code,
     depth,
     requestCommit,
@@ -267,13 +271,13 @@ export const Widget = React.forwardRef((props, forwardedRef) => {
       <>
         {element}
         {transactions && (
-          <ConfirmTransactions            
+          <ConfirmTransactions
             transactions={transactions}
             widgetSrc={src}
             onHide={(result) => {
               setTransactions(null);
               if (result && result.transaction) {
-                cache.invalidateCache(near, result.transaction.receiver_id);        
+                cache.invalidateCache(near, result.transaction.receiver_id);
               }
             }}
             networkId={networkId}
@@ -296,6 +300,6 @@ export const Widget = React.forwardRef((props, forwardedRef) => {
   ) : (
     loading ?? Loading
   );
-  
+
   return widget;
 });

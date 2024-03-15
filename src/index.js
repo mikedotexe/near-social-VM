@@ -1,6 +1,7 @@
 import React from "react";
 import { useAccount, useAccountId } from "./lib/data/account";
 import { useInitNear, useNear } from "./lib/data/near";
+import { useInitBitcoin, useBitcoin } from "./lib/data/bitcoin";
 import { Widget } from "./lib/components/Widget";
 import { useCache } from "./lib/data/cache";
 import * as utils from "./lib/data/utils";
@@ -12,6 +13,8 @@ export {
   CommitButton,
   useInitNear,
   useNear,
+  useInitBitcoin,
+  useBitcoin,
   useCache,
   useAccount,
   useAccountId,
