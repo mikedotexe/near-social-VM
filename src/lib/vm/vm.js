@@ -2375,7 +2375,7 @@ export default class VM {
   renderCode(args) {
     if (this.compileError) {
       const { message, stack } = this.compileError;
-      this.vm.near.config.errorCallback({scope: ErrorScopes.Compilation, message});
+      this.near.config.errorCallback({scope: ErrorScopes.Compilation, message});
       return (
         <div className="alert alert-danger">
           Compilation error:
@@ -2386,7 +2386,7 @@ export default class VM {
     }
     if (!this.alive) {
       const message = "VM is dead";
-      this.vm.near.config.errorCallback({scope: ErrorScopes.Render, message});
+      this.near.config.errorCallback({scope: ErrorScopes.Render, message});
       return <div className="alert alert-danger">{message}</div>;
     }
 
