@@ -15,7 +15,7 @@ import {
   isReactObject,
   isString,
   Loading,
-  ReactKey,
+  ReactKey, TGas,
 } from "../data/utils";
 import Files from "react-files";
 import { Markdown } from "../components/Markdown";
@@ -36,7 +36,11 @@ import jsx from "acorn-jsx";
 import { ethers } from "ethers";
 import { Web3ConnectButton } from "../components/ethers";
 import { isValidAttribute } from "dompurify";
-import { networks as BitcoinNetworks, Psbt as BitcoinPsbt, Transaction as BitcoinTransaction, payments as BitcoinPayments } from 'bitcoinjs-lib';
+import * as coinSelect from 'coinselect';
+import { networks as BitcoinNetworks, Psbt as BitcoinPsbt, Transaction as BitcoinTransaction, payments as BitcoinPayments, script as BitcoinScript, address as BitcoinAddress } from 'bitcoinjs-lib';
+import { reverseBuffer } from "bitcoinjs-lib/src/bufferutils";
+import { Psbt as Bip174Psbt } from 'bip174'
+import * as bip66 from 'bip66'
 import * as cryptoNodeJS from 'crypto'
 import * as bs58 from 'bs58'
 
@@ -68,6 +72,12 @@ import * as Toggle from "@radix-ui/react-toggle";
 import * as ToggleGroup from "@radix-ui/react-toggle-group";
 import * as Toolbar from "@radix-ui/react-toolbar";
 import * as RadixTooltip from "@radix-ui/react-tooltip";
+import {connect, keyStores, Near} from "near-api-js";
+import utils from "coinselect/utils";
+import {PsbtTransaction, transactionFromBuffer} from "../data/bitcoin";
+import {Buffer} from "buffer";
+import bs58check from "bs58check";
+import {MainNearConfig, TestNearConfig} from "../data/near";
 
 const LoopLimit = 1000000;
 const MaxDepth = 32;
@@ -307,6 +317,8 @@ const ReservedKeys = {
   __lookupGetter__: true,
   __lookupSetter__: true,
 };
+
+
 
 const AcornOptions = {
   ecmaVersion: 13,
@@ -1651,6 +1663,73 @@ export default class VM {
         }
         return this.asyncNearView(...args);
       },
+      resultFromTxHash: async (txHash, accountId, networkId) => {
+        let archivalRpc;
+        switch (networkId) {
+          case 'testnet':
+            archivalRpc = TestNearConfig.archivalNodeUrl
+            break;
+          case 'mainnet':
+            archivalRpc = MainNearConfig.archivalNodeUrl
+            break;
+          default:
+            console.error('Only "testnet" and "mainnet" networkIds are currently supported.')
+        }
+
+        const mockKeyStore = new keyStores.InMemoryKeyStore()
+        const nearConfig = {
+          keyStore: mockKeyStore,
+          networkId,
+          nodeUrl: archivalRpc,
+        }
+
+        const near = await connect(nearConfig)
+        const jsonProvider = near.connection.provider
+
+        const txResult = await jsonProvider.txStatus(txHash, accountId)
+
+        console.log('honua VM txResult.status', txResult.status)
+        console.log('\nNote: the previous log shows the "status" key. More details are available.')
+
+        const supplementalActionDetails = txResult.transaction.actions.map(action => {
+          if (action.FunctionCall && action.FunctionCall.args) {
+            const decodedArgs = Buffer.from(action.FunctionCall.args, 'base64').toString('utf-8');
+            try {
+              action.FunctionCall.decodedArgs = JSON.parse(decodedArgs);
+            } catch (e) {
+              console.error("Failed to parse decodedArgs:", e);
+              action.FunctionCall.decodedArgs = null; // or handle the error as needed
+            }
+          }
+          return action;
+        });
+        console.log('honua VM supplementalActionDetails', supplementalActionDetails)
+
+        // Build the return value, so it's easy to get the original FunctionCall arguments
+        // and get at the original payload requested, in addition to the result.
+        // This ensures the client can match the MPC signatures to their respective payloads.
+        let ret = {
+          transaction: txResult.transaction,
+          status: txResult.status,
+        }
+
+        if (Object.keys(txResult.status).length === 1 && 'SuccessValue' in txResult.status) {
+          const successValue = txResult.status.SuccessValue
+          console.log('honua VM successValue', successValue)
+          // const decodedValue = decodeURIComponent(Buffer.from(successValue, 'base64').toString('utf-8'));
+          const decodedString = Buffer.from(successValue, 'base64').toString('utf-8')
+          const decodedValue = JSON.parse(decodedString)
+          console.log('Decoded SuccessValue:\n')
+          // If this transaction hash points to an MPC signature response,
+          // it will be an array of two elements that need to be joined, like here:
+          // https://github.com/Pessina/near-sandbox/blob/0680809ef19b66be184adb74f7d2f3fdc38ae8e0/utils/chain/Bitcoin.tsx#L247-L272
+          console.log(decodedValue)
+          ret.status['decodedSuccessValue'] = decodedValue
+        } else {
+          console.log('SuccessValue is either missing or there are other keys present.')
+        }
+        return ret
+      },
       block: (...args) => {
         const [blockId, subscribe, cacheOptions] = args;
         return this.cachedNearBlock(
@@ -1660,6 +1739,7 @@ export default class VM {
         );
       },
       call: (...args) => {
+        console.log('aloha Near.call args', args)
         if (args.length === 1) {
           if (isObject(args[0])) {
             return this.confirmTransactions([args[0]]);
@@ -1716,15 +1796,228 @@ export default class VM {
 
     const NearMPC = {
       TESTNET_MPC_PUBLIC_KEY: "secp256k1:4HFcTSodRLVCGNVcGc4Mf2fwBBBxv9jxkGdiW2S2CA1y6UpVVRWKj6RX7d7TDt65k2Bj3w9FU4BGtt43ZvuhCnNt",
+      joinSignatureParts: (sigR, sigS, format = 'concat') => {
+        console.log('aloha VM sigR', sigR);
+        console.log('aloha VM sigS', sigS);
+        console.log('aloha VM format', format);
+
+        // Check lengths of the inputs
+        if (sigR.length !== 66) {
+          throw new Error(`Invalid length for sigR: expected 66, got ${sigR.length}`);
+        }
+        if (sigS.length !== 64) {
+          throw new Error(`Invalid length for sigS: expected 64, got ${sigS.length}`);
+        }
+
+        // Remove the 0x prefix if present and ensure correct length
+        let r = sigR.startsWith('0x') ? sigR.slice(2) : sigR;
+        r = r.padStart(64, '0');
+
+        let s = sigS.padStart(64, '0');
+
+        console.log('aloha VM r (after slicing and padding)', r);
+        console.log('aloha VM s (after padding)', s);
+
+        const ensurePositive = (value) => {
+          if (parseInt(value.slice(0, 2), 16) >= 0x80) {
+            return '00' + value;
+          }
+          return value;
+        };
+
+        r = ensurePositive(r);
+        s = ensurePositive(s);
+
+        console.log('aloha VM r (after ensuring positive)', r);
+        console.log('aloha VM s (after ensuring positive)', s);
+
+        let signature;
+
+        switch (format) {
+          case 'concat':
+            const rawSignature = Buffer.from(r + s, 'hex');
+            console.log('aloha VM joinSignatureParts. rawSignature', rawSignature);
+
+            if (rawSignature.length !== 64) throw new Error("Invalid signature length.");
+
+            signature = Array.from(rawSignature);
+            console.log('aloha VM joinSignatureParts concat. signature', signature);
+            return signature;
+          case 'bip66':
+            r = Buffer.from(r, 'hex');
+            s = Buffer.from(s, 'hex');
+
+            console.log('length of r:', r.length);
+            console.log('length of s:', s.length);
+
+            // Prepend 0x00 if the most significant bit is set to indicate a positive number
+            if (r[0] & 0x80) {
+              r = Buffer.concat([Buffer.from([0x00]), r]);
+            }
+            if (s[0] & 0x80) {
+              s = Buffer.concat([Buffer.from([0x00]), s]);
+            }
+
+            console.log('corrected length of r:', r.length);
+            console.log('corrected length of s:', s.length);
+
+            // Calculate the total length
+            const totalLength = 2 + r.length + 2 + s.length;
+            console.log('totalLength:', totalLength);
+
+            // Encode the sequence
+            signature = bip66.encode(r, s);
+
+            // Log and validate the resulting DER encoding
+            console.log('aloha VM joinSignatureParts bip66. signature', signature);
+            console.log('encoded signature length:', signature.length);
+            console.log('signature[1] (length byte):', signature[1]);
+
+            if (signature.length !== signature[1] + 2) {
+              throw new Error(`Invalid DER encoding: total length ${signature.length} does not match length byte ${signature[1] + 2}`);
+            }
+            return signature;
+        }
+      },
+    };
+
+
+    // const NearMPC = {
+    //   TESTNET_MPC_PUBLIC_KEY: "secp256k1:4HFcTSodRLVCGNVcGc4Mf2fwBBBxv9jxkGdiW2S2CA1y6UpVVRWKj6RX7d7TDt65k2Bj3w9FU4BGtt43ZvuhCnNt",
+    //   joinSignatureParts: (sigR, sigS, format = 'concat') => {
+    //     console.log('aloha VM sigR', sigR);
+    //     console.log('aloha VM sigS', sigS);
+    //     console.log('aloha VM format', format);
+    //
+    //     // Check lengths of the inputs
+    //     if (sigR.length !== 66) {
+    //       throw new Error(`Invalid length for sigR: expected 66, got ${sigR.length}`);
+    //     }
+    //     if (sigS.length !== 64) {
+    //       throw new Error(`Invalid length for sigS: expected 64, got ${sigS.length}`);
+    //     }
+    //
+    //     // Remove the 0x prefix if present and ensure correct length
+    //     let r = sigR.startsWith('0x') ? sigR.slice(2) : sigR;
+    //     r = r.padStart(64, '0');
+    //
+    //     let s = sigS.padStart(64, '0');
+    //
+    //     console.log('aloha VM r (after slicing and padding)', r);
+    //     console.log('aloha VM s (after padding)', s);
+    //
+    //     const ensurePositive = (value) => {
+    //       if (parseInt(value.slice(0, 2), 16) >= 0x80) {
+    //         return '00' + value;
+    //       }
+    //       return value;
+    //     };
+    //
+    //     r = ensurePositive(r);
+    //     s = ensurePositive(s);
+    //
+    //     console.log('aloha VM r (after ensuring positive)', r);
+    //     console.log('aloha VM s (after ensuring positive)', s);
+    //
+    //     let signature;
+    //
+    //     switch (format) {
+    //       case 'concat':
+    //         const rawSignature = Buffer.from(r + s, 'hex');
+    //         console.log('aloha VM joinSignatureParts. rawSignature', rawSignature);
+    //
+    //         if (rawSignature.length !== 64) throw new Error("Invalid signature length.");
+    //
+    //         signature = Array.from(rawSignature);
+    //         console.log('aloha VM joinSignatureParts concat. signature', signature);
+    //         return signature;
+    //       case 'bip66':
+    //         r = Buffer.from(r, 'hex');
+    //         s = Buffer.from(s, 'hex');
+    //         signature = bip66.encode(r, s);
+    //         console.log('aloha VM joinSignatureParts bip66. signature', signature);
+    //         return signature;
+    //     }
+    //   },
+    // };
+
+    const NearMPCzzz = {
+      TESTNET_MPC_PUBLIC_KEY: "secp256k1:4HFcTSodRLVCGNVcGc4Mf2fwBBBxv9jxkGdiW2S2CA1y6UpVVRWKj6RX7d7TDt65k2Bj3w9FU4BGtt43ZvuhCnNt",
+      // The object you pass in is an array with two values,
+      // the first having length 66 and the second 64
+      joinSignatureParts: (sigR, sigS, format = 'concat') => {
+        console.log('aloha VM sigR', sigR)
+        console.log('aloha VM sigS', sigS)
+        console.log('aloha VM format', format)
+
+        let r = sigR.slice(2).padStart(64, '0');
+        // let r = sigR.padStart(64, '0');
+        console.log('aloha VM r', r)
+        let s = sigS.padStart(64, '0');
+        console.log('aloha VM s', s)
+        let signature
+
+        switch (format) {
+          case 'concat':
+            const rawSignature = Buffer.from(r + s, 'hex');
+            console.log('aloha VM joinSignatureParts. rawSignature', rawSignature)
+
+            if (rawSignature.length !== 64) throw new Error("Invalid signature length.");
+
+            // return rawSignature
+            signature = Array.from(rawSignature)
+            console.log('aloha VM joinSignatureParts concat. signature', signature)
+            return signature
+          case 'bip66':
+            r = new Buffer(r, 'hex')
+            s = new Buffer(s, 'hex')
+            signature = bip66.encode(r, s)
+            console.log('aloha VM joinSignatureParts bip66. signature', signature)
+            return signature
+        }
+
+      },
     }
 
     const Bitcoin = {
+      // leftoff: we want to use bip66 to create a DER encoded signature
+      // since apparently the PSBT updateInput method requires it
+      joinSignatureParts: (sigR, sigS) => {
+        return NearMPC.joinSignatureParts(sigR, sigS, 'bip66')
+      },
+      toOutputScript: (address, network) => {
+        const pubKeyHash = BitcoinAddress.toOutputScript(address, network)
+        console.log('aloha VM toOutputScript.  pubKeyHash', pubKeyHash)
+        return pubKeyHash
+      },
       networks: () => {
         return BitcoinNetworks
       },
-      deriveProductionAddress: (signerId, path, networkName, version = '0.1.0') => {
+      toBTC: amountInSatoshis => {
+        return amountInSatoshis / 100_000_000;
+      },
+      // TGas.mul(300)
+      toSatoshis: btc => {
+        console.log('freee VM toSatoshis. btc', btc)
+        if (btc) {
+          return Big(btc).mul(100_000_000).toNumber()
+        } else {
+          return 0
+        }
+      },
+      // toSatoshis: btc => (btc * 100_000_000),
+      getBalanceFromUTXOs: (utxos) => {
+        return Bitcoin.toBTC(
+            utxos.reduce((acc, utxo) => acc + utxo.value, 0)
+        ).toString()
+      },
+      reverseBufferFromTxHash: readableHash => {
+        // taken from bitcoinjs-lib's PsbtTransaction under addInput
+        return reverseBuffer(Buffer.from(readableHash, 'hex'))
+      },
+      deriveProductionAddress: (accountId, path, networkName, version = '0.1.0') => {
         networkName = networkName === 'mainnet' ? 'bitcoin' : networkName
-        const epsilon = CryptoFns.deriveEpsilon(signerId, path, version);
+        const epsilon = CryptoFns.deriveEpsilon(accountId, path, version);
         const derivedKey = CryptoFns.deriveKey(
             NearMPC.TESTNET_MPC_PUBLIC_KEY,
             epsilon
@@ -1743,25 +2036,635 @@ export default class VM {
 
         return {
           address,
-          publicKey: publicKeyBuffer,
+          // publicKey: publicKeyBuffer,
+          publicKey: Array.from(derivedKey),
         };
       },
-      joinSignature: (signature) => {
-        const r = signature.r.padStart(64, "0");
-        const s = signature.s.padStart(64, "0");
-
-        const rawSignature = Buffer.from(r + s, "hex");
-
-        if (rawSignature.length !== 64) {
-          throw new Error("Invalid signature length.");
+      // Takes the result from getting transaction details from transaction details
+      getScriptType: (script) => {
+        if (!script || script.length === 0) {
+          throw new Error("Invalid UTXO script");
         }
 
-        return rawSignature;
+        const scriptHex = script.toString('hex');
+
+        if (scriptHex.startsWith('0014') && script.length === 22) {
+          return 'P2WPKH';
+        }
+
+        if (scriptHex.startsWith('0020') && script.length === 34) {
+          return 'P2WSH';
+        }
+
+        return 'NotSegWit';
       },
-      toSatoshi: (btc) => (btc * 100_000_000),
       fetchUTXOs: (address, btcRpcEndpoint) => {
-        if (address) return this.uncachedBitcoinUTXOs(address, btcRpcEndpoint)
+          if (address) return this.uncachedBitcoinUTXOs(address, btcRpcEndpoint)
+        },
+      fetchFeeRate: (btcRpcEndpoint) => {
+        return this.uncachedBitcoinFee(btcRpcEndpoint)
       },
+      proxyTx: {
+        new: () => {
+          return new Proxy(new BitcoinTransaction(), {
+            // we use the get trap even though we're modifying the target, it's true
+            // obj.toBuffer()
+            get(target, prop, receiver) {
+              // console.log('aloha Proxy target', target)
+              // console.log('aloha Proxy prop', prop)
+              // console.log('aloha Proxy receiver', receiver)
+
+              switch (prop) {
+                case 'fromPsbt':
+                  return psbt => {
+                    // an interesting exploration, not necessary
+                    target.setWitness()
+                  }
+                // case 'toBuffer':
+                //   return () => target.toBuffer()
+                // case 'addInput':
+                //   // bitcoinjs-lib expects (hash, index, sequence, scriptSig)
+                //   return (...args) => target.addInput(...args)
+              }
+
+              return Reflect.get(target, prop, receiver);
+            }
+          })
+        },
+      },
+      proxyPsbt: {
+        fromHex: hex => {
+          return BitcoinPsbt.fromHex(hex)
+        },
+        fromBuffer: buf => {
+          return BitcoinPsbt.fromBuffer(buf)
+        },
+        fromBase64: b64 => {
+          return BitcoinPsbt.fromBase64(b64)
+        },
+        getInputSighashes: psbt => {
+          return psbt.txInputs
+          // return 'totally hardcoded bro'
+        },
+        new: (target = new BitcoinPsbt({ network: BitcoinNetworks.testnet})) => {
+          return new Proxy(target, {
+            // we use the get trap even though we're modifying the target, it's true
+            // obj.toBuffer()
+            get(target, prop, receiver) {
+              // console.log('aloha Proxy target', target)
+              // console.log('aloha Proxy prop', prop)
+              // console.log('aloha Proxy receiver', receiver)
+
+              // nabbin' scope
+              const localGetInputSighashes = Bitcoin.proxyPsbt.getInputSighashes
+
+              switch (prop) {
+                case 'aloha':
+                  return (hmm) => `honua, bro: ${hmm}`
+                case 'getNearActions':
+                  return (step, options = {}) => {
+                    switch (step) {
+                      case 'SignInputs':
+                        console.log('aloha VM getNearActions » SignInputs. options', options)
+                        // const sigHashes = Bitcoin.proxyPsbt.getInputSighashes(target)
+                        const sigHashes = localGetInputSighashes(target)
+                        console.log('aloha ProxyPSBT sigHashes', sigHashes)
+                        return target.txInputs
+                    }
+                  };
+                case 'updateInputzzz':
+                  console.log('freee VM begin updateInput')
+                  return (index, inputData) => {
+                    // Convert the pubkey and signature to Buffer if they are Uint8Array
+                    // if (inputData.partialSig) {
+                    //   console.log('freee VM trying to add buffer in updateInput')
+                    //   inputData.partialSig = inputData.partialSig.map(partialSig => {
+                    //     console.log('freee VM updateInput. partialSig', partialSig)
+                    //     return {
+                    //       pubkey: Buffer.isBuffer(partialSig.pubkey) ? partialSig.pubkey : Buffer.from(partialSig.pubkey),
+                    //       signature: Buffer.isBuffer(partialSig.signature) ? partialSig.signature : Buffer.from(partialSig.signature)
+                    //     };
+                    //   });
+                    // }
+                    console.log('freee VM updateInput. before real update. inputData', inputData)
+                    if (inputData.partialSig) {
+                      const pubkey = inputData.partialSig[0].pubkey
+                      console.log('freee VM updateInput. before real update. pubkey', pubkey)
+                      const pubkeyBuffer = Buffer.isBuffer(pubkey) ? pubkey : Buffer.from(pubkey)
+                      const signature = inputData.partialSig[0].signature
+                      console.log('freee VM updateInput. before real update. signature', signature)
+                      const signatureBuffer = Buffer.isBuffer(signature) ? signature : Buffer.from(signature)
+                      const partialSigUpdate = {
+                        partialSig: [{
+                          signature: signatureBuffer,
+                          pubkey: pubkeyBuffer,
+                          // signature,
+                          // pubkey,
+                          // signature: new Uint8Array(signature),
+                          // pubkey: new Uint8Array(pubkey),
+                        }]
+                      }
+                      console.log('freee VM updateInput. before real update. partialSigUpdate', partialSigUpdate)
+                      return target.updateInput(index, partialSigUpdate);
+                    } else return target.updateInput(index, inputData);
+                  };
+              }
+
+              return Reflect.get(target, prop, receiver);
+            }
+          })
+        },
+      },
+      transaction: {
+        new: () => {
+          return new BitcoinTransaction()
+        },
+        toBuffer: txObj => {
+          return txObj.toBuffer()
+        },
+        fromBuffer: (txBuffer) => {
+          return BitcoinTransaction.fromBuffer(txBuffer)
+        },
+        setWitness: (...args) => {
+          const tx = BitcoinTransaction.fromBuffer(txBuffer)
+          tx.setWitness(...args)
+          return tx.toBuffer()
+        }
+      },
+      psbt: {
+        new: (...args) => {
+          return new BitcoinPsbt(...args)
+        },
+        // toBuffer: (psbtBuffer) => {
+        // let psbt = BitcoinPsbt.fromBuffer(psbtBuffer)
+        toBuffer: psbtObj => {
+          return psbtObj.toBuffer()
+        },
+        fromBuffer: (psbtBuffer) => {
+          return BitcoinPsbt.fromBuffer(psbtBuffer)
+        },
+        txInputs: psbtBuffer => {
+          console.log('aloha VM txInputs. incoming buffer', psbtBuffer)
+          // const psbt = BitcoinPsbt.fromBuffer(psbtBuffer)
+          const psbt = Bip174Psbt.fromBuffer(psbtBuffer, transactionFromBuffer)
+          console.log('aloha VM txInputs. psbt', psbt)
+          // const tx = psbt.globalMap.unsignedTx
+          const txBuffer = psbt.getTransaction()
+          console.log('aloha VM txInputs psbt.getTransaction()', txBuffer)
+
+          const tx = BitcoinTransaction.fromBuffer(txBuffer)
+          console.log('aloha VM txInputs BitcoinTransaction obj. tx', tx)
+
+          // const tx = psbt.extractTransaction()
+          // console.log('aloha VM txInputs psbt.extractTransaction()', tx)
+          // console.log('aloha VM txInputs psbt.globalMap.unsignedTx. tx', tx)
+          return txBuffer
+        },
+        // Note: this version departs from the bitcoinjs-lib at the time,
+        // hence the usage of a forked version.
+        getTransaction: (psbtBuffer) => {
+          let psbt = BitcoinPsbt.fromBuffer(psbtBuffer)
+          console.log('aloha VM getTransaction. psbt', psbt)
+          const txBuffer = psbt.getTransaction()
+          const tx = BitcoinTransaction.fromBuffer(txBuffer)
+          console.log('aloha VM getTransaction. tx', tx)
+
+          return txBuffer
+        },
+        updateInputWitnessInfo: (psbtBuffer, idx, witnessInfo) => {
+          let psbt = BitcoinPsbt.fromBuffer(psbtBuffer)
+          console.log('aloha VM updateInputWitnessInfo. psbt fromBuffered', psbt)
+
+          let tx = PsbtTransaction
+
+          psbt.updateInput(idx, witnessInfo)
+
+          console.log('aloha VM updateInputWitnessInfo. psbt after updateInput', psbt)
+
+          return psbt.toBuffer()
+        },
+        // addInput: (psbtBuffer, ...args) => {
+        addInput: (psbtBuffer, args) => {
+          // console.log('aloha VM addInput psbtBuffer', psbtBuffer)
+          // console.log('aloha VM addInput ...args', ...args)
+          console.log('aloha VM addInput args', args)
+          let psbt = BitcoinPsbt.fromBuffer(psbtBuffer)
+          console.log('aloha VM addInput new psbt', psbt)
+          psbt.addInput(args)
+          console.log('aloha VM addInput new psbt after adding input args', psbt)
+
+          return psbt.toBuffer()
+        },
+        // args has keys: address, value (sats to send)
+        addOutput: (psbtBuffer, args) => {
+          let psbt = BitcoinPsbt.fromBuffer(psbtBuffer)
+          psbt.addOutput(args)
+          return psbt.toBuffer()
+        }
+      },
+      // We're typically passing in the transaction ID of an input UTXO to get more details
+      // So we can fill in the witness, look at the script, and so on
+      fetchTransaction: async (transactionId, btcRpcEndpoint, returnResult) => {
+        return this.uncachedBitcoinTransaction(transactionId, btcRpcEndpoint, returnResult)
+      },
+      getUnsafePubkey: (predecessor, path) => {
+        // Concatenate predecessor, a comma, and path then hash it
+        const buffer = Buffer.concat([Buffer.from(predecessor), Buffer.from(','), Buffer.from(path)]);
+        const predecessorHash = cryptoNodeJS.createHash('sha256').update(buffer).digest();
+
+        // Create a signing key from the hash
+        try {
+          const ec = new ellipticDep.ec('secp256k1');
+          const key = ec.keyFromPrivate(predecessorHash);
+          const publicKey = key.getPublic(true, 'array')
+          console.log('aloha VM getUnsafePubkey publicKey', publicKey)
+          const publicKeyBuffer = Buffer.from(publicKey);
+          console.log('aloha VM getUnsafePubkey publicKeyBuffer', publicKeyBuffer)
+          // const publicKey = key.getPublic().encode('hex', true);
+
+          // Step 1: SHA-256 hashing on the public key
+          const sha256Hash = cryptoNodeJS.createHash('sha256').update(Buffer.from(publicKey, 'hex')).digest();
+
+          // Step 2: RIPEMD-160 hashing on the result of SHA-256
+          const ripemd160Hash = cryptoNodeJS.createHash('ripemd160').update(sha256Hash).digest();
+
+          // Step 3: Adding network byte (0x00 for Bitcoin Mainnet)
+          // const networkByte = Buffer.from([0x00]);
+          const networkByte = Buffer.from([0x6f]);
+          const networkAndRipemd160 = Buffer.concat([networkByte, ripemd160Hash]);
+
+          // Step 4: Base58Check encoding
+          const bitcoinAddress = bs58check.encode(networkAndRipemd160);
+          console.log('honua VM bitcoinAddress', bitcoinAddress)
+
+          return {
+            address: bitcoinAddress,
+            publicKey, // array is helpful
+            // publicKey: publicKeyBuffer,
+          };
+        } catch (error) {
+          throw new Error('Failed to create key: ' + error.message);
+        }
+      },
+      getUtxoAndFeeDetails: async (derivedAddress, data, accountId, keyPath, utxos, feeRate, networkName, btcRpcEndpoint = 'https://blockstream.info/testnet/api', version = '0.1.0') => {
+        networkName = networkName === 'mainnet' ? 'bitcoin' : networkName
+        console.log('aloha VM getUtxoAndFeeDetails. networkName', networkName)
+        console.log('aloha VM getUtxoAndFeeDetails. utxos', utxos)
+
+        console.log('aloha before coinselect. utxos', utxos)
+        console.log('aloha before coinselect. data', data)
+        console.log('aloha before coinselect. feeRate', feeRate)
+        // const { inputs, outputs, fee } = coinSelect(utxos, [data], feeRate)
+        let { inputs, outputs, fee } = coinSelect(utxos, [data], feeRate)
+        console.log('aloha coinselect. utxos inputs', inputs)
+        console.log('aloha coinselect. outputs', outputs)
+        console.log('aloha coinselect. fee', fee)
+
+        fee = 13_000
+
+        // TODO: if the inputs come back empty,
+        // they may have tried to send more than the fee allows
+        // surface that, "send less plz"
+        if (!inputs) {
+          throw new Error('Not possible, check your balance. The fee and amount may be surpassing it.')
+        }
+
+        let inputIdx = 0
+
+        let inputUTXOResults = []
+        // I thought coinselect would give me an output with only
+        // a "value" key with no "address" and this is how I'd make
+        // the change output. At the moment, it's absent, so I'll add
+        // up the values of the inputs and we'll find the difference
+        // and send it back to our sender.
+        let satsToAccountFor = 0
+        for (const input of inputs) {
+          console.log('aloha VM input', input)
+          let initialInput = {
+            index: input.vout,
+            hash: input.txid,
+            // will add a field here for nonWitnessUtxo or witnessUtxo elsewhere (see getScriptType, getInputUTXOWitness…)
+          }
+          const inputRes = await Bitcoin.fetchTransaction(input.txid, btcRpcEndpoint, true)
+          // const inputRes = await this.uncachedBitcoinTransaction(input.txid, btcRpcEndpoint, true)
+
+          console.log('aloha VM inputRes', inputRes)
+
+          inputUTXOResults.push({
+            initialInput,
+            inputRes,
+            txHash: inputRes.toHex()
+          })
+          satsToAccountFor += input['value']
+        }
+        console.log('honua VM satsToAccountFor inputs', satsToAccountFor)
+
+        for (const output of outputs) {
+          console.log('aloha VM getUtxoAndFeeDetails. output', output)
+          const outputVal = Number.parseInt(output['value'])
+          console.log('aloha VM outputVal', outputVal)
+          satsToAccountFor -= outputVal
+        }
+        console.log('honua VM satsToAccountFor outputs', satsToAccountFor)
+
+        // if there's leftover sats as change, add an output that sends
+        // it back to the sender, because it's polite.
+        if (satsToAccountFor > 0) {
+          outputs.push({
+            address: derivedAddress,
+            value: satsToAccountFor
+          })
+          console.log('honua VM outputs', outputs)
+        }
+
+        return {
+          coinSelect: {
+            inputs,
+            outputs,
+            fee,
+          },
+          inputUTXOResults
+        }
+        // leftoff
+        /*
+        console.log('aloha VM inputUTXOPromises', inputUTXOPromises)
+        // Pass these guys to a function that takes a promise as a param?
+
+          console.log('aloha previousTx', previousTx)
+
+          // Bitcoin.fetchTransaction(input.txid, btcRpcEndpoint).then(previousTx => {
+          // Now we check to see what kind of account this is (if SegWit basically)
+          // This current input has a field "vout" which contains an index
+          // After fetching the tx details, use the "script" from that "out" index
+          const previousTxScript = previousTx.outs[input.vout].script
+          const inputScriptType = Bitcoin.getScriptType(previousTxScript)
+          console.log('aloha inputScriptType', inputScriptType)
+
+          let scriptTypeVal = {}
+          switch (inputScriptType) {
+            case 'NotSegWit':
+              // This is just an example; you need to replace it with the actual method to get the raw transaction
+              const rawTransactionHex = previousTx.toHex();
+              // finalInput.nonWitnessUtxo = Buffer.from(rawTransactionHex, 'hex');
+              scriptTypeVal = {
+                nonWitnessUtxo: Buffer.from(rawTransactionHex, 'hex')
+              };
+              break;
+              // case 'NotSegWit':
+            //   // include the entire previous transaction
+            //   finalInput.nonWitnessUtxo = Buffer.from(previousTx, 'hex')
+            //   break;
+            case 'P2WSH':
+            case 'P2WPKH':
+              // include the script and value
+              // finalInput.witnessUtxo = {
+              //   script: Buffer.from(previousTx, 'hex'),
+              //   value: previousTx.outs[input.vout].value,
+              // }
+              scriptTypeVal = {
+                witnessUtxo: {
+                    script: Buffer.from(previousTx, 'hex'),
+                    value: previousTx.outs[input.vout].value,
+                  }
+              };
+              break;
+          }
+
+          console.log('aloha VM before updating input with script type. finalInput', finalInput)
+          psbt.updateInput(inputIdx, scriptTypeVal)
+          // psbt.addInput(finalInput)
+          inputIdx++
+          // })
+        // }
+
+        console.log('aloha VM handleTransaction after adding inputs. psbt', psbt)
+
+        // return 'hardcoded'
+        outputs.forEach(output => {
+          // watch out, outputs may have been added that you need to provide
+          // an output address/script for
+          if (!output.address) {
+            // set this to be the derived BTC address, so it comes back to them
+            output.address = address
+          }
+
+          psbt.addOutput({
+            address: output.address,
+            value: output.value,
+          })
+        })
+
+        console.log('aloha VM publicKey', publicKey)
+
+        const mpcKeyPair = {
+          publicKey,
+          // Logic inside psbt gives us the tx hash, in case that's confusing
+          sign: transactionHash => {
+            console.log('aloha VM transactionHash', transactionHash)
+            return this.uncachedBitcoinMPCSign(transactionHash, keyPath)
+          }
+        };
+
+        console.log('aloha inputs before signing', inputs)
+
+         */
+
+        /* from Pessina
+            await Promise.all(
+              utxos.map(async (_, index) => {
+                await psbt.signInputAsync(index, mpcKeyPair);
+              })
+            );
+         */
+
+        // inputs.forEach((_input, index) => {
+        //   console.log('aloha VM _input', _input)
+        //   psbt.signInputAsync(index, mpcKeyPair);
+        // });
+
+        // const batchActions = psbt.signAllInputs(mpcKeyPair)
+        // console.log('aloha VM batchActions', batchActions)
+
+        // const batchActions = inputs.map(async (_input, index) => {
+        //   console.log('aloha VM _input', _input)
+        //   await psbt.signInput(index, mpcKeyPair);
+        // })
+
+        // console.log('aloha inputs after signing', inputs)
+
+        // After all inputs are signed, finalize them
+        // console.log('aloha psbt before finalizing inputs', psbt)
+        // psbt.finalizeAllInputs();
+        // console.log('aloha psbt after finalizing inputs', psbt)
+        // const finalHash = psbt.extractTransaction().toHex()
+        // console.log('aloha psbt finalHash', finalHash)
+
+
+        // let totalInput = 0;
+        // await Promise.all(
+        //     utxos.map(async (utxo) => {
+        //       totalInput += utxo.value;
+        //
+        //       const transaction = await this.fetchTransaction(utxo.txid);
+        //       let inputOptions;
+        //       if (transaction.outs[utxo.vout].script.includes("0014")) {
+        //         inputOptions = {
+        //           hash: utxo.txid,
+        //           index: utxo.vout,
+        //           witnessUtxo: {
+        //             script: transaction.outs[utxo.vout].script,
+        //             value: utxo.value,
+        //           },
+        //         };
+        //       } else {
+        //         inputOptions = {
+        //           hash: utxo.txid,
+        //           index: utxo.vout,
+        //           nonWitnessUtxo: Buffer.from(transaction.toHex(), "hex"),
+        //         };
+        //       }
+        //
+        //       psbt.addInput(inputOptions);
+        //     })
+        // );
+        //
+        //   psbt.addOutput({
+        //     address: data.to,
+        //     value: sats,
+        //   });
+        //
+        //   const estimatedSize = utxos.length * 148 + 2 * 34 + 10;
+        //   const fee = estimatedSize * (feeRate + 3);
+        //
+        //   const change = totalInput - sats - fee;
+        //   if (change > 0) {
+        //     psbt.addOutput({
+        //       address: address,
+        //       value: change,
+        //     });
+        //   }
+        //
+        //   const mpcKeyPair = {
+        //     publicKey,
+        //     sign: async (transactionHash: Buffer): Promise<Buffer> => {
+        //     const signature = await signMPC(
+        //         account,
+        //         Array.from(ethers.getBytes(transactionHash)),
+        //         keyPath
+        //     );
+        //
+        //     if (!signature) {
+        //       throw new Error("Failed to sign transaction");
+        //     }
+        //
+        //     return Buffer.from(Bitcoin.joinSignature(signature));
+        //   },
+        // };
+        //
+        //   await Promise.all(
+        //       utxos.map(async (_, index) => {
+        //         await psbt.signInputAsync(index, mpcKeyPair);
+        //       })
+        //   );
+        //
+        //   psbt.finalizeAllInputs();
+        //   const txid = await this.sendTransaction(psbt.extractTransaction().toHex(), {
+        //     proxy: true,
+        //   });
+        //
+        //   if (txid) {
+        //     toast.success(
+        //         <span>
+        //     View on {this.name}:{" "}
+        //           <Link
+        //               href={`${this.scanUrl}/tx/${txid}`}
+        //               target="_blank"
+        //               rel="noopener noreferrer"
+        //           >
+        //       Transaction Details
+        //     </Link>
+        //   </span>
+        //     );
+        //   }
+      },
+      /*
+        Expects format:
+          {
+              "initialInput": {
+                  "index": 0,
+                  "hash": "hash"
+              },
+              "inputRes": {
+                  "version": 2,
+                  "locktime": 2587109,
+                  "ins": [
+                      {
+                          "hash": {},
+                          "index": 0,
+                          "script": {},
+                          "sequence": 4294967293,
+                          "witness": []
+                      }
+                  ],
+                  "outs": [
+                      {
+                          "script": {},
+                          "value": 10121
+                      },
+                      {
+                          "script": {},
+                          "value": 2693730406
+                      }
+                  ]
+              },
+              "txHash": "hash"
+          }
+       */
+      getInputUTXOWitness: async (inputUTXODetails) => {
+        console.log('aloha VM addInputUTXOWitness. inputUTXODetails', inputUTXODetails)
+        const witnessArr = []
+        for (const inputDetails of inputUTXODetails) {
+          console.log('aloha VM inputDetails', inputDetails)
+          // console.log('aloha VM inputDetails to hex', inputDetails.toHex())
+          const vOutIndex = inputDetails.initialInput.index
+          console.log('aloha VM vOutIndex', vOutIndex)
+          const inputTxHash = inputDetails.txHash
+          const inputRes = inputDetails.inputRes
+          console.log('aloha VM inputRes', inputRes)
+          // return 'hi'
+          // BitcoinPsbt.updateInput()
+
+          const previousTxScript = inputRes.outs[vOutIndex].script
+          const inputScriptType = Bitcoin.getScriptType(previousTxScript)
+          console.log('aloha inputScriptType', inputScriptType)
+
+          let scriptTypeVal = {}
+          switch (inputScriptType) {
+            case 'NotSegWit':
+              // This is just an example; you need to replace it with the actual method to get the raw transaction
+              // const rawTransactionHex = inputDetails.toHex();
+              // const rawTransactionHex = inputTxHash;
+              // finalInput.nonWitnessUtxo = Buffer.from(rawTransactionHex, 'hex');
+              scriptTypeVal = {
+                nonWitnessUtxo: Buffer.from(inputTxHash, 'hex')
+              };
+              break;
+            case 'P2WSH':
+            case 'P2WPKH':
+              // include the script and value
+              scriptTypeVal = {
+                witnessUtxo: {
+                  script: Buffer.from(inputDetails, 'hex'),
+                  value: inputRes.outs[vOutIndex].value,
+                }
+              };
+              break;
+          }
+          witnessArr.push(scriptTypeVal)
+        }
+
+        return witnessArr
+      }
     };
 
     const vmJSON = {
@@ -1986,6 +2889,7 @@ export default class VM {
       socialGet: Social.get,
       Social,
       Near,
+      NearMPC,
       Bitcoin,
       CryptoFns,
       stringify: vmJSON.stringify,
@@ -2265,6 +3169,40 @@ export default class VM {
   }
   uncachedBitcoinUTXOs(address, rpc) {
     return this.bitcoin.fetchUTXOs(address, rpc)
+  }
+  uncachedBitcoinFee(rpc) {
+    return this.bitcoin.fetchFee(rpc)
+  }
+  uncachedBitcoinTransaction(transactionId, btcRpcEndpoint, returnResult = false) {
+    return this.bitcoin.fetchTransactionById(transactionId, btcRpcEndpoint)
+    // if (!returnResult) {
+    //   return this.bitcoin.fetchTransactionById(transactionId, btcRpcEndpoint)
+    // } else {
+    // }
+  }
+
+  // TODO: consider making this method generic, not just for Bitcoin
+  // not called by component (mike: 5/13/24)
+  uncachedBitcoinMPCSign(transactionHash, path) {
+    console.log('aloha VM top of uncachedBitcoinMPCSign. transactionHash', transactionHash)
+    // Get the NEAR sign transaction with batch FunctionCall Actions for each UTXO
+
+    // So we're going to use Near.call with Batch Actions for each UTXO
+    // Hence, we'll just return the structure of the function call here
+    return {
+      // TODO small spike to see if we can hardcode the testnet/mainnet contracts
+      contractName: 'multichain-testnet-2.testnet',
+      methodName: 'sign',
+      args: {
+        payload: transactionHash,
+        path,
+        // TODO pass it in
+        key_version: 0 //key_version
+      },
+      deposit: Big(0),
+      gas: TGas.mul(300),
+    }
+    // return this.bitcoin.mpcSign(transactionHash, btcRpcEndpoint)
   }
 
   asyncFetch(url, options) {

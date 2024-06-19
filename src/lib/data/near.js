@@ -19,7 +19,7 @@ export const functionCallCreator = UseLegacyFunctionCallCreator
   })
   : nearAPI.transactions.functionCall;
 
-const TestNearConfig = {
+export const TestNearConfig = {
   networkId: "testnet",
   nodeUrl: "https://rpc.testnet.near.org",
   archivalNodeUrl: "https://rpc.testnet.internal.near.org",
@@ -204,7 +204,8 @@ async function functionCall(
       ],
     });
   } catch (e) {
-    // const msg = e.toString();
+    const msg = e.toString();
+    console.log('aloha error doing function call', msg, e)
     // if (msg.indexOf("does not have enough balance") !== -1) {
     //   return await refreshAllowanceObj.refreshAllowance();
     // }
